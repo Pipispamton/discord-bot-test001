@@ -10,14 +10,18 @@ import logging
 import functools
 from datetime import datetime, timezone, timedelta
 from discord.ui import Modal, TextInput, View, Button
+import datetime as _dt  # 既存の imports に近い位置に追加してください
 
-DEBUG = True
+DEBUG = False
 
 DATA_FILE = "roles_data.json"
 SETTINGS_FILE = "bot_settings_debug.json" if DEBUG else "bot_settings.json"
 ROLE_HISTORY_FILE = "role_add_history.json"
 LOG_CHANNEL_FILE = "log_channel_settings.json"
+TENURE_RULES_FILE = "tenure_role_rules.json"
 BACKUP_DIR = "backup"
+# 保存するバックアップ世代数（ここを変更するだけで制御可能）
+BACKUP_KEEP_GENERATIONS = 20
 
 JST = timezone(timedelta(hours=9))
 now_jst = lambda: datetime.now(JST)
@@ -67,6 +71,7 @@ class DataManager:
         self.settings = {}
         self.role_add_history = {}
         self.guild_log_channels = {}
+        self.tenure_rules = {}
         self._lock = asyncio.Lock()
         self.load_all()
 
@@ -75,6 +80,7 @@ class DataManager:
         self.settings = self._load_json(SETTINGS_FILE, {"remove_seconds": DEFAULT_REMOVE_SECONDS.copy()})
         self.role_add_history = self._load_json(ROLE_HISTORY_FILE, {})
         self.guild_log_channels = self._load_json(LOG_CHANNEL_FILE, {})
+        self.tenure_rules = self._load_json(TENURE_RULES_FILE, {})
         # 履歴変換
         for g, users in self.role_add_history.items():
             for u, roles in users.items():
@@ -111,13 +117,15 @@ class DataManager:
             old_settings = self._load_json(SETTINGS_FILE, {})
             old_history = self._load_json(ROLE_HISTORY_FILE, {})
             old_log = self._load_json(LOG_CHANNEL_FILE, {})
-            if old_data != self.role_data or old_settings != self.settings or old_history != self.role_add_history or old_log != self.guild_log_channels:
+            old_tenure = self._load_json(TENURE_RULES_FILE, {})
+            if old_data != self.role_data or old_settings != self.settings or old_history != self.role_add_history or old_log != self.guild_log_channels or old_tenure != self.tenure_rules:
                 self._backup_data()
                 changed = True
             self._save_json(DATA_FILE, self.role_data)
             self._save_json(SETTINGS_FILE, self.settings)
             self._save_json(ROLE_HISTORY_FILE, self.role_add_history)
             self._save_json(LOG_CHANNEL_FILE, self.guild_log_channels)
+            self._save_json(TENURE_RULES_FILE, self.tenure_rules)
 
     def _backup_data(self):
         os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -127,6 +135,7 @@ class DataManager:
             (SETTINGS_FILE, f"settings_{ts}.json"),
             (ROLE_HISTORY_FILE, f"role_history_{ts}.json"),
             (LOG_CHANNEL_FILE, f"log_channel_{ts}.json"),
+            (TENURE_RULES_FILE, f"tenure_rules_{ts}.json"),
         ]
         for src, dst in backup_targets:
             if os.path.exists(src):
@@ -136,18 +145,21 @@ class DataManager:
     def _cleanup_old_backups(self):
         try:
             # roles_data, settings, role_history, log_channel それぞれ10世代まで残す
+            # 各種バックアッププレフィックス
             patterns = [
                 "roles_data_",
                 "settings_",
                 "role_history_",
                 "log_channel_",
+                "tenure_rules_",
             ]
             for pat in patterns:
                 backups = sorted(
                     [f for f in os.listdir(BACKUP_DIR) if f.startswith(pat)],
                     reverse=True
                 )
-                for old_backup in backups[10:]:
+                # 定数 BACKUP_KEEP_GENERATIONS を使って古い世代を削除
+                for old_backup in backups[BACKUP_KEEP_GENERATIONS:]:
                     os.remove(os.path.join(BACKUP_DIR, old_backup))
         except Exception as e:
             logger.error(f"Backup cleanup error: {e}")
@@ -194,6 +206,45 @@ class DataManager:
             return True
         except Exception:
             return False
+
+def is_valid_guild_data(guild_id: str) -> bool:
+    """ギルドのデータが有効か確認"""
+    try:
+        if not guild_id or not isinstance(guild_id, str):
+            return False
+        # 数値文字列か確認
+        int(guild_id)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+def validate_role_data(data: dict) -> bool:
+    """ロールデータの整合性を確認"""
+    try:
+        if not isinstance(data, dict):
+            return False
+        for guild_id, guild_data in data.items():
+            if not is_valid_guild_data(guild_id):
+                logger.warning(f"Invalid guild_id format: {guild_id}")
+                return False
+            if not isinstance(guild_data, dict):
+                return False
+            for user_id, user_roles in guild_data.items():
+                if not isinstance(user_id, str) or not user_id.isdigit():
+                    logger.warning(f"Invalid user_id format: {user_id}")
+                    return False
+                if not isinstance(user_roles, dict):
+                    return False
+                for role_name, timestamp in user_roles.items():
+                    if not isinstance(role_name, str):
+                        return False
+                    if not isinstance(timestamp, (int, float)):
+                        logger.warning(f"Invalid timestamp for {role_name}: {timestamp}")
+                        return False
+        return True
+    except Exception as e:
+        logger.error(f"Role data validation error: {e}")
+        return False
 
 intents = discord.Intents.default()
 intents.members = True
@@ -252,19 +303,83 @@ async def add_role_with_timestamp(member, role, reason=None):
             bot.data.role_data[guild_id][user_id][role.name] = now_ts
         await member.add_roles(role, reason=reason or "自動ロール付与")
         await bot.data.save_all()
+        
+        # テニュアチェック実行: このロール付与がトリガーなら追加ロール付与
+        await check_and_apply_tenure_role(member, role)
+        
         return True
     except Exception as e:
         logger.error(f"Role add error for {member}: {e}")
         return False
 
+async def check_and_apply_tenure_role(member, trigger_role):
+    """トリガーロール付与時に、メンバーの参加期間をチェックして対象ロールを付与"""
+    guild_id = str(member.guild.id)
+    if guild_id not in bot.data.tenure_rules:
+        return
+    
+    rules = bot.data.tenure_rules[guild_id]
+    trigger_role_name = trigger_role.name
+    
+    if trigger_role_name not in rules:
+        return
+    
+    rule = rules[trigger_role_name]
+    target_role_name = rule.get("target_role")
+    tenure_days = rule.get("tenure_days", 90)
+    
+    if not target_role_name:
+        return
+    
+    # メンバーのサーバー参加日時をチェック
+    member_tenure_days = (now_jst() - member.joined_at).days if member.joined_at else 0
+    
+    if member_tenure_days >= tenure_days:
+        target_role = discord.utils.get(member.guild.roles, name=target_role_name)
+        if target_role and target_role not in member.roles:
+            try:
+                await member.add_roles(
+                    target_role,
+                    reason=f"テニュアルール: {trigger_role_name} 付与時、参加期間{tenure_days}日以上で自動付与"
+                )
+                await log_message(
+                    member.guild,
+                    f"{member.display_name} は参加から{member_tenure_days}日経過しており、{trigger_role_name} 付与時に {target_role_name} を自動付与",
+                    "success"
+                )
+            except Exception as e:
+                logger.error(f"Tenure role assignment error for {member}: {e}")
+
 async def sync_data_with_reality(guild, is_periodic=False):
     try:
-        now = now_jst().timestamp()
+        # メンバー情報が未ロードなら同期スキップ
+        if not guild.chunked or len(guild.members) == 0:
+            logger.warning(f"[{guild.name}] メンバー情報が不完全のため同期をスキップしました。")
+            return {"removed": 0, "added": 0}
+        
+        # データの有効性確認
         guild_id = str(guild.id)
+        if not is_valid_guild_data(guild_id):
+            logger.error(f"Invalid guild_id: {guild_id}")
+            return {"removed": 0, "added": 0}
+        
+        # ファイルから最新データを再読み込み
+        try:
+            current_role_data = bot.data._load_json(DATA_FILE, {})
+            if not validate_role_data(current_role_data):
+                logger.error(f"[{guild.name}] ロールデータの検証に失敗しました。同期をスキップします。")
+                return {"removed": 0, "added": 0}
+            bot.data.role_data = current_role_data
+        except Exception as e:
+            logger.error(f"[{guild.name}] ファイル再読み込み失敗: {e}。同期をスキップします。")
+            return {"removed": 0, "added": 0}
+        
+        now = now_jst().timestamp()
         bot.data.role_data.setdefault(guild_id, {})
         current_holders = {}
-        # set型で高速化
         auto_roles_set = set(ROLES_TO_AUTO_REMOVE)
+        
+        # 実在するロール保持者を走査
         for member in guild.members:
             if member.bot:
                 continue
@@ -273,8 +388,11 @@ async def sync_data_with_reality(guild, is_periodic=False):
             target_roles = auto_roles_set & member_roles
             if target_roles:
                 current_holders[user_id] = list(target_roles)
+        
         changes = {"removed": 0, "added": 0}
         users_to_remove = []
+        
+        # 保存データとの比較
         for user_id, user_roles in list(bot.data.role_data[guild_id].items()):
             if user_id not in current_holders:
                 users_to_remove.append(user_id)
@@ -286,8 +404,11 @@ async def sync_data_with_reality(guild, is_periodic=False):
                         changes["removed"] += 1
                 if not bot.data.role_data[guild_id][user_id]:
                     users_to_remove.append(user_id)
+        
         for user_id in users_to_remove:
             del bot.data.role_data[guild_id][user_id]
+        
+        # 新しい保持者を追加
         for user_id, roles in current_holders.items():
             bot.data.role_data.setdefault(guild_id, {}).setdefault(user_id, {})
             for role_name in roles:
@@ -296,10 +417,13 @@ async def sync_data_with_reality(guild, is_periodic=False):
                     if role_name in ROLES_TO_AUTO_REMOVE:
                         bot.data.add_role_history(guild_id, user_id, role_name, now)
                     changes["added"] += 1
+        
+        # 変更があれば保存とログ
         if changes["removed"] or changes["added"]:
             await bot.data.save_all()
             sync_msg = f"{'定期' if is_periodic else '起動時'}同期: 削除{changes['removed']}件, 追加{changes['added']}件"
             await log_message(guild, sync_msg, "info")
+        
         return changes
     except Exception as e:
         logger.error(f"Sync error for {guild.name}: {e}")
@@ -375,8 +499,34 @@ async def check_roles():
 async def sync_data_periodically():
     try:
         for guild in bot.guilds:
-            await sync_data_with_reality(guild, True)
+            # ファイルから最新データを再読み込み（再試行ロジック付き）
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # ファイルの有効性確認
+                    test_data = bot.data._load_json(DATA_FILE, {})
+                    if not validate_role_data(test_data):
+                        logger.warning(f"定期同期: ロールデータ検証失敗（試行 {attempt + 1}/{max_retries}）")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)  # 指数バックオフ
+                            continue
+                        else:
+                            logger.error(f"定期同期: {guild.name} のデータ読み込みに失敗。このギルドをスキップします。")
+                            break
+                    
+                    # データが有効ならば同期実行
+                    await sync_data_with_reality(guild, True)
+                    break  # 成功したらループを抜ける
+                    
+                except Exception as e:
+                    logger.warning(f"定期同期: ファイル読み込み失敗（試行 {attempt + 1}/{max_retries}）: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)  # 指数バックオフ: 1秒 → 2秒 → 4秒
+                    else:
+                        logger.error(f"定期同期: {guild.name} のデータ読み込みが {max_retries} 回失敗。スキップします。")
+            
             await asyncio.sleep(1)
+        
         await bot.data.save_all()
     except Exception as e:
         logger.error(f"Periodic sync error: {e}")
@@ -389,15 +539,63 @@ async def wait_until_ready():
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} - {len(bot.guilds)} guilds")
+    await bot.wait_until_ready()
+    
     for guild in bot.guilds:
-        await log_message(guild, f"Bot起動完了 ({now_jst().strftime('%Y/%m/%d %H:%M:%S')} JST)", "success")
-        await sync_data_with_reality(guild)
+        try:
+            if not guild.chunked:
+                logger.info(f"[{guild.name}] メンバー情報をロード中...")
+                await guild.chunk()
+            
+            # 起動時同期でのデータ検証と再試行
+            max_retries = 3
+            sync_success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    # ファイルから最新データを再読み込み
+                    test_data = bot.data._load_json(DATA_FILE, {})
+                    if not validate_role_data(test_data):
+                        logger.warning(f"起動時同期: [{guild.name}] ロールデータ検証失敗（試行 {attempt + 1}/{max_retries}）")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        else:
+                            logger.error(f"起動時同期: [{guild.name}] データ検証が {max_retries} 回失敗。スキップします。")
+                            break
+                    
+                    # データが有効なら同期実行
+                    await sync_data_with_reality(guild)
+                    sync_success = True
+                    break  # 成功したらループを抜ける
+                    
+                except Exception as e:
+                    logger.warning(f"起動時同期: [{guild.name}] ファイル読み込み失敗（試行 {attempt + 1}/{max_retries}）: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"起動時同期: [{guild.name}] ファイル読み込みが {max_retries} 回失敗。スキップします。")
+            
+            # ログ出力
+            if sync_success:
+                await log_message(guild, f"Bot起動完了 ({now_jst().strftime('%Y/%m/%d %H:%M:%S')} JST)", "success")
+            else:
+                await log_message(guild, f"Bot起動完了ですが、データ同期に失敗しました。ファイルを確認してください。", "warning")
+                
+        except Exception as e:
+            logger.error(f"[{guild.name}] 起動時処理中にエラー: {e}")
+    
+    # すべてのguildの処理後にデータ保存
     await bot.data.save_all()
+    
+    # 定期タスク起動
     if not check_roles.is_running():
         check_roles.start()
     if not sync_data_periodically.is_running():
         sync_data_periodically.start()
-    await check_roles.coro()
+    
+    # check_roles の即時実行
+    await asyncio.create_task(check_roles.coro())
 
 def admin_required(func):
     @functools.wraps(func)
@@ -844,6 +1042,10 @@ async def help_command(interaction: discord.Interaction):
         "/show_role_history": "ロール付与履歴表示（注意・警告のみ。理由編集機能付き）",
         "/sync_check": "手動同期・チェック（管理者限定）",
         "/set_log_channel": "このチャンネルをログ送信先に設定（管理者限定）",
+        "/set_tenure_rule": "テニュアルール設定（管理者限定）",
+        "/show_tenure_rules": "テニュアルール一覧表示",
+        "/delete_tenure_rule": "テニュアルール削除（管理者限定）",
+        "/restore_backup": "バックアップから復元（管理者限定）",
         "/message": "指定したチャンネルにメッセージ送信"
     }
     for cmd, desc in commands_info.items():
@@ -855,12 +1057,10 @@ async def help_command(interaction: discord.Interaction):
             "\n• 不定期起動対応"
             "\n• ロール付与履歴確認・理由編集可能（注意・警告のみ）"
             "\n• ページネーション対応（各ロール5件ずつ表示）"
-            "\n• 理由編集後の自動更新機能"
+            "\n• **テニュアルール機能: 特定ロール付与時に参加期間をチェック**"
+            "\n• `/set_tenure_rule` でトリガーロール→対象ロール マッピング設定可能"
+            "\n• 例: 'チェック' ロール付与時、参加90日以上なら 'メンバー' ロール自動付与"
             "\n• ログ送信先チャンネルをサーバーごとに設定可能"
-            "\n• `/message` で好きなメッセージを任意のチャンネルに投稿可能"
-            "\n   例: `/message Hello world! general`"
-            "\n• `/adjust_remove_time` で個人のロール削除までの残り時間を柔軟に調整可能"
-            "\n• `/show_remove_time` で自動削除ロールの残り時間を確認可能"
         ),
         inline=False
     )
@@ -890,6 +1090,209 @@ async def show_remove_time(interaction: discord.Interaction, user: discord.Membe
     if not found:
         embed.description = "自動削除対象ロールは付与されていません。"
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="set_tenure_rule", description="トリガーロール付与時のテニュアベース自動付与ルール設定（管理者限定）")
+@app_commands.describe(
+    trigger_role="この役割が付与されたときにチェック",
+    target_role="付与対象の役割",
+    tenure_days="サーバー参加からの経過日数"
+)
+@admin_required
+async def set_tenure_rule(
+    interaction: discord.Interaction,
+    trigger_role: discord.Role,
+    target_role: discord.Role,
+    tenure_days: int = 90
+):
+    if tenure_days < 1:
+        await interaction.response.send_message("❌ 参加日数は1日以上で指定してください", ephemeral=True)
+        return
+    
+    guild_id = str(interaction.guild.id)
+    bot.data.tenure_rules.setdefault(guild_id, {})
+    
+    old_rule = bot.data.tenure_rules[guild_id].get(trigger_role.name)
+    
+    bot.data.tenure_rules[guild_id][trigger_role.name] = {
+        "target_role": target_role.name,
+        "tenure_days": tenure_days
+    }
+    
+    await bot.data.save_all()
+    
+    old_info = f"対象役割: {old_rule['target_role']}, 期間: {old_rule['tenure_days']}日" if old_rule else "ルールなし"
+    
+    embed = await create_embed(
+        "✅ テニュアルール設定完了", 0x00ff00,
+        トリガー役割=trigger_role.name,
+        対象役割=target_role.name,
+        参加経過日数=f"{tenure_days}日以上",
+        変更前=old_info
+    )
+    
+    await interaction.response.send_message(embed=embed)
+    await log_message(
+        interaction.guild,
+        f"{interaction.user.display_name} が テニュアルールを設定: {trigger_role.name} → {target_role.name} ({tenure_days}日以上)",
+        "info"
+    )
+
+@bot.tree.command(name="show_tenure_rules", description="設定されているテニュアルール一覧表示")
+async def show_tenure_rules(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    rules = bot.data.tenure_rules.get(guild_id, {})
+    
+    embed = discord.Embed(
+        title="📋 テニュアルール一覧",
+        color=0x0099ff,
+        description="トリガーロール付与時に参加期間をチェックして追加ロールを付与"
+    )
+    
+    if not rules:
+        embed.description += "\n\n⚠️ ルール設定がありません"
+        await interaction.response.send_message(embed=embed)
+        return
+    
+    for trigger_role, rule in rules.items():
+        target_role = rule.get("target_role", "不明")
+        tenure_days = rule.get("tenure_days", 90)
+        embed.add_field(
+            name=f"🔔 {trigger_role}",
+            value=f"→ **{target_role}** (参加{tenure_days}日以上で自動付与)",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="delete_tenure_rule", description="テニュアルールを削除（管理者限定）")
+@app_commands.describe(trigger_role="削除するトリガー役割")
+@admin_required
+async def delete_tenure_rule(interaction: discord.Interaction, trigger_role: discord.Role):
+    guild_id = str(interaction.guild.id)
+    rules = bot.data.tenure_rules.get(guild_id, {})
+    
+    if trigger_role.name not in rules:
+        await interaction.response.send_message(
+            f"❌ '{trigger_role.name}' のテニュアルール設定が見つかりません",
+            ephemeral=True
+        )
+        return
+    
+    old_rule = rules[trigger_role.name]
+    del bot.data.tenure_rules[guild_id][trigger_role.name]
+    
+    if not bot.data.tenure_rules[guild_id]:
+        del bot.data.tenure_rules[guild_id]
+    
+    await bot.data.save_all()
+    
+    embed = await create_embed(
+        "✅ テニュアルール削除完了", 0x00ff00,
+        トリガー役割=trigger_role.name,
+        対象役割=old_rule.get("target_role"),
+        参加経過日数=f"{old_rule.get('tenure_days', 90)}日"
+    )
+    
+    await interaction.response.send_message(embed=embed)
+    await log_message(
+        interaction.guild,
+        f"{interaction.user.display_name} が テニュアルール削除: {trigger_role.name}",
+        "info"
+    )
+
+def _backup_current_file_to_dir(src_path: str, prefix: str):
+    """現在のファイル(src_path)をBACKUP_DIRへタイムスタンプ付きでコピー（存在する場合のみ）"""
+    try:
+        if not os.path.exists(src_path):
+            return None
+        ts = now_jst().strftime("%Y%m%d_%H%M%S")
+        dst_name = f"{prefix}{ts}.json"
+        dst_path = os.path.join(BACKUP_DIR, dst_name)
+        shutil.copy2(src_path, dst_path)
+        return dst_path
+    except Exception as e:
+        logger.error(f"Backup current file failed: {e}")
+        return None
+
+def _compose_backup_filename(data_type: str, timestamp: str) -> str:
+    """data_type + timestamp -> backup filename"""
+    prefix_map = {
+        "roles_data": "roles_data_",
+        "settings": "settings_",
+        "role_history": "role_history_",
+        "log_channel": "log_channel_",
+        "tenure_rules": "tenure_rules_",
+    }
+    prefix = prefix_map.get(data_type)
+    if not prefix:
+        return ""
+    return f"{prefix}{timestamp}.json"
+
+def _data_type_to_file(data_type: str) -> str:
+    mapping = {
+        "roles_data": DATA_FILE,
+        "settings": SETTINGS_FILE,
+        "role_history": ROLE_HISTORY_FILE,
+        "log_channel": LOG_CHANNEL_FILE,
+        "tenure_rules": TENURE_RULES_FILE,
+    }
+    return mapping.get(data_type, "")
+
+def _validate_timestamp_format(ts: str) -> bool:
+    try:
+        _dt.datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        return True
+    except Exception:
+        return False
+
+@bot.tree.command(name="restore_backup", description="バックアップからデータ復元（管理者限定）")
+@app_commands.describe(data_type="復元するデータ種別", timestamp="バックアップのタイムスタンプ (YYYYMMDD_HHMMSS)")
+@app_commands.choices(data_type=[
+    app_commands.Choice(name="roles_data", value="roles_data"),
+    app_commands.Choice(name="settings", value="settings"),
+    app_commands.Choice(name="role_history", value="role_history"),
+    app_commands.Choice(name="log_channel", value="log_channel"),
+    app_commands.Choice(name="tenure_rules", value="tenure_rules"),
+])
+@admin_required
+async def restore_backup(interaction: discord.Interaction, data_type: str, timestamp: str):
+    """指定バックアップを復元する。復元前に元ファイルをバックアップ、復元後にもバックアップを作成します。"""
+    await interaction.response.defer(thinking=True)
+    if not _validate_timestamp_format(timestamp):
+        await interaction.followup.send("❌ タイムスタンプ形式が不正です。YYYYMMDD_HHMMSS の形式で指定してください。", ephemeral=True)
+        return
+
+    backup_filename = _compose_backup_filename(data_type, timestamp)
+    backup_path = os.path.join(BACKUP_DIR, backup_filename)
+    if not os.path.exists(backup_path):
+        await interaction.followup.send(f"❌ 指定されたバックアップが見つかりません: {backup_filename}", ephemeral=True)
+        return
+
+    target_file = _data_type_to_file(data_type)
+    if not target_file:
+        await interaction.followup.send("❌ 不正なデータ種別です。", ephemeral=True)
+        return
+
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        # 1) 復元前に現在のファイルをバックアップ
+        pre_backup = _backup_current_file_to_dir(target_file, backup_filename.split('_')[0] + "_pre_")
+        # 2) 指定バックアップから復元（上書き）
+        shutil.copy2(backup_path, target_file)
+        # 3) 復元後のファイルをバックアップ（別タイムスタンプ）
+        post_backup = _backup_current_file_to_dir(target_file, backup_filename.split('_')[0] + "_restored_")
+        # 4) メモリ上のデータを再読み込み
+        bot.data.load_all()
+        await interaction.followup.send(
+            f"✅ 復元完了: {data_type}\n"
+            f"指定バックアップ: {backup_filename}\n"
+            f"復元前バックアップ: {os.path.basename(pre_backup) if pre_backup else 'なし'}\n"
+            f"復元後バックアップ: {os.path.basename(post_backup) if post_backup else 'なし'}"
+        )
+        await log_message(interaction.guild, f"{interaction.user.display_name} がバックアップから復元: {data_type} ← {backup_filename}", "info")
+    except Exception as e:
+        logger.error(f"Restore backup failed: {e}")
+        await interaction.followup.send(f"❌ 復元に失敗しました: {e}", ephemeral=True)
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
