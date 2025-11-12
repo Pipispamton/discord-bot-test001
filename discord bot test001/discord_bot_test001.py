@@ -313,27 +313,27 @@ async def add_role_with_timestamp(member, role, reason=None):
         return False
 
 async def check_and_apply_tenure_role(member, trigger_role):
-    """トリガーロール付与時に、メンバーの参加期間をチェックして対象ロールを付与"""
+    """トリガーロール付与時に、メンバーの参加期間をチェックして対象ロールを付与し、トリガーロールを削除"""
     guild_id = str(member.guild.id)
     if guild_id not in bot.data.tenure_rules:
         return
-    
+
     rules = bot.data.tenure_rules[guild_id]
     trigger_role_name = trigger_role.name
-    
+
     if trigger_role_name not in rules:
         return
-    
+
     rule = rules[trigger_role_name]
     target_role_name = rule.get("target_role")
     tenure_days = rule.get("tenure_days", 90)
-    
+
     if not target_role_name:
         return
-    
+
     # メンバーのサーバー参加日時をチェック
     member_tenure_days = (now_jst() - member.joined_at).days if member.joined_at else 0
-    
+
     if member_tenure_days >= tenure_days:
         target_role = discord.utils.get(member.guild.roles, name=target_role_name)
         if target_role and target_role not in member.roles:
@@ -349,6 +349,18 @@ async def check_and_apply_tenure_role(member, trigger_role):
                 )
             except Exception as e:
                 logger.error(f"Tenure role assignment error for {member}: {e}")
+
+    # 対象ロール付与処理後にトリガーロールを削除
+    try:
+        if trigger_role in member.roles:
+            await member.remove_roles(trigger_role, reason="テニュアルール処理後に自動削除")
+            await log_message(
+                member.guild,
+                f"{member.display_name} からトリガーロール '{trigger_role_name}' を自動削除",
+                "info"
+            )
+    except Exception as e:
+        logger.error(f"Trigger role removal error for {member}: {e}")
 
 async def sync_data_with_reality(guild, is_periodic=False):
     try:
@@ -417,13 +429,27 @@ async def sync_data_with_reality(guild, is_periodic=False):
                     if role_name in ROLES_TO_AUTO_REMOVE:
                         bot.data.add_role_history(guild_id, user_id, role_name, now)
                     changes["added"] += 1
-        
+
         # 変更があれば保存とログ
         if changes["removed"] or changes["added"]:
             await bot.data.save_all()
             sync_msg = f"{'定期' if is_periodic else '起動時'}同期: 削除{changes['removed']}件, 追加{changes['added']}件"
             await log_message(guild, sync_msg, "info")
-        
+
+        # --- 追加: テニュアルールのトリガーロールを持つメンバーを検知して処理 ---
+        tenure_rules = bot.data.tenure_rules.get(guild_id, {})
+        if tenure_rules:
+            trigger_role_names = set(tenure_rules.keys())
+            for member in guild.members:
+                if member.bot:
+                    continue
+                member_role_names = set(r.name for r in member.roles)
+                for trigger_role_name in trigger_role_names & member_role_names:
+                    trigger_role_obj = discord.utils.get(guild.roles, name=trigger_role_name)
+                    if trigger_role_obj:
+                        await check_and_apply_tenure_role(member, trigger_role_obj)
+                        # 1ユーザーが複数トリガーロール持っている場合も全て処理
+
         return changes
     except Exception as e:
         logger.error(f"Sync error for {guild.name}: {e}")
@@ -1111,7 +1137,7 @@ async def set_tenure_rule(
         "info"
     )
 
-@bot.tree.command(name="show_tenure_rules", description="設定されているテニュアルール一覧表示")
+@bot.tree.command(name="show_tenure_rules", description="設定されているテニュアベース自動付与ルール一覧表示")
 async def show_tenure_rules(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     rules = bot.data.tenure_rules.get(guild_id, {})
