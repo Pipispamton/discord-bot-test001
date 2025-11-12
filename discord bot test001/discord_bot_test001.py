@@ -539,6 +539,12 @@ async def wait_until_ready():
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} - {len(bot.guilds)} guilds")
+    # --- 追加: 起動時に改めてコマンド同期を実行（guilds が空であった setup_hook を補完） ---
+    try:
+        await bot._sync_commands()
+    except Exception as e:
+        logger.warning(f"Command sync in on_ready failed: {e}")
+    # --- 既存処理続行 ---
     await bot.wait_until_ready()
     
     for guild in bot.guilds:
@@ -547,43 +553,11 @@ async def on_ready():
                 logger.info(f"[{guild.name}] メンバー情報をロード中...")
                 await guild.chunk()
             
-            # 起動時同期でのデータ検証と再試行
-            max_retries = 3
-            sync_success = False
-            
-            for attempt in range(max_retries):
-                try:
-                    # ファイルから最新データを再読み込み
-                    test_data = bot.data._load_json(DATA_FILE, {})
-                    if not validate_role_data(test_data):
-                        logger.warning(f"起動時同期: [{guild.name}] ロールデータ検証失敗（試行 {attempt + 1}/{max_retries}）")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
-                            continue
-                        else:
-                            logger.error(f"起動時同期: [{guild.name}] データ検証が {max_retries} 回失敗。スキップします。")
-                            break
-                    
-                    # データが有効なら同期実行
-                    await sync_data_with_reality(guild)
-                    sync_success = True
-                    break  # 成功したらループを抜ける
-                    
-                except Exception as e:
-                    logger.warning(f"起動時同期: [{guild.name}] ファイル読み込み失敗（試行 {attempt + 1}/{max_retries}）: {e}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        logger.error(f"起動時同期: [{guild.name}] ファイル読み込みが {max_retries} 回失敗。スキップします。")
-            
-            # ログ出力
-            if sync_success:
-                await log_message(guild, f"Bot起動完了 ({now_jst().strftime('%Y/%m/%d %H:%M:%S')} JST)", "success")
-            else:
-                await log_message(guild, f"Bot起動完了ですが、データ同期に失敗しました。ファイルを確認してください。", "warning")
-                
+            # ロード完了後に同期とログ出力
+            await log_message(guild, f"Bot起動完了 ({now_jst().strftime('%Y/%m/%d %H:%M:%S')} JST)", "success")
+            await sync_data_with_reality(guild)
         except Exception as e:
-            logger.error(f"[{guild.name}] 起動時処理中にエラー: {e}")
+            logger.error(f"[{guild.name}] 同期中にエラー: {e}")
     
     # すべてのguildの処理後にデータ保存
     await bot.data.save_all()
