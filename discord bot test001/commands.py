@@ -528,6 +528,89 @@ def setup_commands(bot):
                 f"❌ メッセージ送信に失敗しました: {e}", ephemeral=True
             )
 
+    @bot.tree.command(name="set_mention_role", description="メンションコマンドの設定（管理者限定）")
+    @app_commands.describe(
+        mention_role="メンション対象のロール",
+        required_role="実行に必要なロール（省略時は誰でも実行可能）"
+    )
+    @admin_required
+    async def set_mention_role(
+        interaction: discord.Interaction,
+        mention_role: discord.Role,
+        required_role: discord.Role = None
+    ):
+        from core import log_message
+        guild_id = str(interaction.guild.id)
+        bot.data.mention_config.setdefault(guild_id, {})
+        
+        old_config = bot.data.mention_config[guild_id].copy() if guild_id in bot.data.mention_config else {}
+        
+        bot.data.mention_config[guild_id] = {
+            "mention_role_id": mention_role.id,
+            "mention_role_name": mention_role.name,
+            "required_role_id": required_role.id if required_role else None,
+            "required_role_name": required_role.name if required_role else "（誰でも実行可能）"
+        }
+        
+        await bot.data.save_all()
+        
+        old_info = f"メンション: {old_config.get('mention_role_name', 'なし')}, 権限: {old_config.get('required_role_name', 'なし')}" if old_config else "ルールなし"
+        
+        embed = await create_embed(
+            "✅ メンション設定完了", 0x00ff00,
+            メンション対象ロール=mention_role.name,
+            実行権限ロール=required_role.name if required_role else "誰でも実行可能",
+            変更前=old_info
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_message(
+            bot, interaction.guild,
+            f"{interaction.user.display_name} がメンション設定を変更: {mention_role.name} / 権限: {required_role.name if required_role else '誰でも'}",
+            "info"
+        )
+
+    @bot.tree.command(name="mention", description="「勧誘歓迎」ロールをメンション")
+    async def mention(interaction: discord.Interaction):
+        from core import log_message
+        guild_id = str(interaction.guild.id)
+        
+        if guild_id not in bot.data.mention_config:
+            await interaction.response.send_message("❌ メンション設定がまだされていません。管理者が `/set_mention_role` で設定してください。", ephemeral=True)
+            return
+        
+        config = bot.data.mention_config[guild_id]
+        required_role_id = config.get("required_role_id")
+        mention_role_id = config.get("mention_role_id")
+        
+        # 権限チェック
+        if required_role_id:
+            required_role = interaction.guild.get_role(required_role_id)
+            if not required_role or required_role not in interaction.user.roles:
+                await interaction.response.send_message(
+                    f"❌ このコマンドを実行するには {config.get('required_role_name', 'unknown')} ロールが必要です。",
+                    ephemeral=True
+                )
+                return
+        
+        # メンション対象ロール取得
+        mention_role = interaction.guild.get_role(mention_role_id)
+        if not mention_role:
+            await interaction.response.send_message("❌ メンション対象ロールが見つかりません。管理者に報告してください。", ephemeral=True)
+            return
+        
+        # メンション送信
+        try:
+            await interaction.response.send_message(f"{mention_role.mention}")
+            await log_message(
+                bot, interaction.guild,
+                f"{interaction.user.display_name} がメンションコマンドを実行: {mention_role.name}",
+                "info"
+            )
+        except Exception as e:
+            logger.error(f"Mention command error: {e}")
+            await interaction.response.send_message("❌ メンション送信に失敗しました。", ephemeral=True)
+
     @bot.tree.command(name="help", description="コマンド一覧表示")
     async def help_command(interaction: discord.Interaction):
         embed = discord.Embed(title="🤖 コマンド一覧", color=0x0099ff)
@@ -545,6 +628,8 @@ def setup_commands(bot):
             "/show_tenure_rules": "テニュアルール一覧表示",
             "/delete_tenure_rule": "テニュアルール削除（管理者限定）",
             "/restore_backup": "バックアップから復元（管理者限定）",
+            "/set_mention_role": "メンション設定（管理者限定）",
+            "/mention": "設定ロールをメンション",
             "/message": "指定したチャンネルにメッセージ送信"
         }
         for cmd, desc in commands_info.items():
@@ -560,6 +645,7 @@ def setup_commands(bot):
                 "\n• `/set_tenure_rule` でトリガーロール→対象ロール マッピング設定可能"
                 "\n• 例: 'チェック' ロール付与時、参加90日以上なら 'メンバー' ロール自動付与"
                 "\n• ログ送信先チャンネルをサーバーごとに設定可能"
+                "\n• **メンション機能: `/set_mention_role` でメンション対象ロール設定後、`/mention` で実行**"
             ),
             inline=False
         )
@@ -722,6 +808,8 @@ def setup_commands(bot):
             logger.error(f"Restore backup failed: {e}")
             await interaction.followup.send(f"❌ 復元に失敗しました: {e}", ephemeral=True)
 
+def setup_command_error_handler(bot):
+    """コマンドエラーハンドラーを登録"""
     @bot.tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
         logger.error(f"Application command error: {error}", exc_info=True)

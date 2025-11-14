@@ -30,16 +30,27 @@ class RoleBot(discord.Client):
         self.removal_lock = asyncio.Lock()
 
     async def setup_hook(self):
+        # コマンドツリーをクリア（重複防止）
+        self.tree.clear_commands(guild=None)
+        for guild in self.guilds:
+            self.tree.clear_commands(guild=guild)
+        
         await self._sync_commands()
 
     async def _sync_commands(self):
         try:
+            # グローバルコマンド同期
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} commands globally")
+            
+            # ギルドコマンド同期
             for guild in self.guilds:
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                logger.info(f"Synced {len(synced)} commands to {guild.name}")
+                try:
+                    self.tree.copy_global_to(guild=guild)
+                    synced = await self.tree.sync(guild=guild)
+                    logger.info(f"Synced {len(synced)} commands to {guild.name} ({guild.id})")
+                except Exception as e:
+                    logger.error(f"Failed to sync commands to {guild.name}: {e}")
         except Exception as e:
             logger.error(f"Command sync error: {e}")
 
@@ -47,10 +58,11 @@ bot = RoleBot()
 
 # イベントとコマンドをインポート・登録
 from events import setup_events
-from commands import setup_commands
+from commands import setup_commands, setup_command_error_handler
 
 setup_events(bot)
 setup_commands(bot)
+setup_command_error_handler(bot)
 
 # ...existing code (tasks, on_ready, TOKEN check, etc)...
 
@@ -73,12 +85,12 @@ async def check_roles():
 async def sync_data_periodically():
     try:
         from core import sync_data_with_reality
+        from helpers import validate_role_data
+        from config import DATA_FILE
         for guild in bot.guilds:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    from helpers import validate_role_data
-                    from config import DATA_FILE
                     test_data = bot.data._load_json(DATA_FILE, {})
                     if not validate_role_data(test_data):
                         logger.warning(f"定期同期: ロールデータ検証失敗（試行 {attempt + 1}/{max_retries}）")
@@ -112,21 +124,28 @@ async def wait_until_ready():
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} - {len(bot.guilds)} guilds")
+    
+    # 起動時にコマンドツリーをクリアして再同期
     try:
+        bot.tree.clear_commands(guild=None)
+        for guild in bot.guilds:
+            bot.tree.clear_commands(guild=guild)
+        logger.info("Command tree cleared")
+        
+        await asyncio.sleep(1)  # API レート制限対応
         await bot._sync_commands()
     except Exception as e:
         logger.warning(f"Command sync in on_ready failed: {e}")
     
     await bot.wait_until_ready()
     
-    from core import sync_data_with_reality
+    from core import sync_data_with_reality, log_message
     for guild in bot.guilds:
         try:
             if not guild.chunked:
                 logger.info(f"[{guild.name}] メンバー情報をロード中...")
                 await guild.chunk()
             
-            from core import log_message
             await log_message(bot, guild, f"Bot起動完了 ({now_jst().strftime('%Y/%m/%d %H:%M:%S')} JST)", "success")
             await sync_data_with_reality(bot, guild)
         except Exception as e:

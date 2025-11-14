@@ -28,3 +28,6 @@ API_DELAY = 0.5 if DEBUG else 0.2
 # ロール設定
 ROLES_TO_AUTO_REMOVE = ["注意", "警告"]
 DEFAULT_REMOVE_SECONDS = {r: (15 if DEBUG else 90 * 86400) for r in ROLES_TO_AUTO_REMOVE}
+
+# メンション設定ファイル
+MENTION_CONFIG_FILE = "mention_config.json"

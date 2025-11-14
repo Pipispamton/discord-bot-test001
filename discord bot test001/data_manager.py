@@ -6,7 +6,7 @@ import asyncio
 import logging
 from config import (
     DATA_FILE, SETTINGS_FILE, ROLE_HISTORY_FILE, LOG_CHANNEL_FILE, TENURE_RULES_FILE,
-    BACKUP_DIR, BACKUP_KEEP_GENERATIONS, ROLES_TO_AUTO_REMOVE, DEFAULT_REMOVE_SECONDS
+    BACKUP_DIR, BACKUP_KEEP_GENERATIONS, ROLES_TO_AUTO_REMOVE, DEFAULT_REMOVE_SECONDS, MENTION_CONFIG_FILE
 )
 from helpers import now_jst
 
@@ -19,6 +19,7 @@ class DataManager:
         self.role_add_history = {}
         self.guild_log_channels = {}
         self.tenure_rules = {}
+        self.mention_config = {}
         self._lock = asyncio.Lock()
         self.load_all()
 
@@ -28,6 +29,7 @@ class DataManager:
         self.role_add_history = self._load_json(ROLE_HISTORY_FILE, {})
         self.guild_log_channels = self._load_json(LOG_CHANNEL_FILE, {})
         self.tenure_rules = self._load_json(TENURE_RULES_FILE, {})
+        self.mention_config = self._load_json(MENTION_CONFIG_FILE, {})
         # 履歴変換
         for g, users in self.role_add_history.items():
             for u, roles in users.items():
@@ -58,18 +60,22 @@ class DataManager:
 
     async def save_all(self):
         async with self._lock:
+            changed = False
             old_data = self._load_json(DATA_FILE, {})
             old_settings = self._load_json(SETTINGS_FILE, {})
             old_history = self._load_json(ROLE_HISTORY_FILE, {})
             old_log = self._load_json(LOG_CHANNEL_FILE, {})
             old_tenure = self._load_json(TENURE_RULES_FILE, {})
-            if old_data != self.role_data or old_settings != self.settings or old_history != self.role_add_history or old_log != self.guild_log_channels or old_tenure != self.tenure_rules:
+            old_mention = self._load_json(MENTION_CONFIG_FILE, {})
+            if old_data != self.role_data or old_settings != self.settings or old_history != self.role_add_history or old_log != self.guild_log_channels or old_tenure != self.tenure_rules or old_mention != self.mention_config:
                 self._backup_data()
+                changed = True
             self._save_json(DATA_FILE, self.role_data)
             self._save_json(SETTINGS_FILE, self.settings)
             self._save_json(ROLE_HISTORY_FILE, self.role_add_history)
             self._save_json(LOG_CHANNEL_FILE, self.guild_log_channels)
             self._save_json(TENURE_RULES_FILE, self.tenure_rules)
+            self._save_json(MENTION_CONFIG_FILE, self.mention_config)
 
     def _backup_data(self):
         os.makedirs(BACKUP_DIR, exist_ok=True)
