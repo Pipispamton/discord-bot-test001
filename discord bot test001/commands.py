@@ -599,17 +599,28 @@ def setup_commands(bot):
             await interaction.response.send_message("❌ メンション対象ロールが見つかりません。管理者に報告してください。", ephemeral=True)
             return
         
-        # メンション送信
+        # メンション送信（通常のメッセージとして送信してメンション通知をトリガー）
         try:
-            await interaction.response.send_message(f"{mention_role.mention}")
+            # defer で応答を確認（ephemeral=True で非表示）
+            await interaction.response.defer(ephemeral=True)
+            
+            # チャンネルに直接メッセージ送信（メンション通知がトリガーされる）
+            mention_message = f"{interaction.user.display_name} が {mention_role.mention} をメンションしました(´・ω・｀)"
+            await interaction.channel.send(mention_message)
+            
+            # ログ記録
             await log_message(
                 bot, interaction.guild,
                 f"{interaction.user.display_name} がメンションコマンドを実行: {mention_role.name}",
                 "info"
             )
+            
+            # ユーザーに確認メッセージを送信（コマンド実行者のみ見える）
+            await interaction.followup.send("✅ メンションを送信しました。", ephemeral=True)
         except Exception as e:
             logger.error(f"Mention command error: {e}")
-            await interaction.response.send_message("❌ メンション送信に失敗しました。", ephemeral=True)
+            # エラーメッセージもコマンド実行者のみ見える
+            await interaction.followup.send("❌ メンション送信に失敗しました。", ephemeral=True)
 
     @bot.tree.command(name="help", description="コマンド一覧表示")
     async def help_command(interaction: discord.Interaction):

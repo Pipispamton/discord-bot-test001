@@ -4,5 +4,11 @@
     "mention_role_name": "勧誘歓迎",
     "required_role_id": 1438154453952757876,
     "required_role_name": "個人アナウンス可"
+  },
+  "1208371334799822888": {
+    "mention_role_id": 1438788484478533683,
+    "mention_role_name": "自動付与ロールテスト",
+    "required_role_id": 1438788484478533683,
+    "required_role_name": "自動付与ロールテスト"
   }
 }

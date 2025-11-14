@@ -154,11 +154,14 @@ async def sync_data_with_reality(bot, guild, is_periodic=False):
                         bot.data.add_role_history(guild_id, user_id, role_name, now)
                     changes["added"] += 1
 
+        # 変更があれば保存とログ
         if changes["removed"] or changes["added"]:
             await bot.data.save_all()
             sync_msg = f"{'定期' if is_periodic else '起動時'}同期: 削除{changes['removed']}件, 追加{changes['added']}件"
-            await log_message(bot, guild, sync_msg, "info")
+            await log_message(guild, sync_msg, "info")
 
+        # --- 追加: テニュアルールのトリガーロールを持つメンバーを検知して処理 ---
+        # これで削除予定だったトリガーロールも正常に処理される
         tenure_rules = bot.data.tenure_rules.get(guild_id, {})
         if tenure_rules:
             trigger_role_names = set(tenure_rules.keys())
@@ -169,7 +172,10 @@ async def sync_data_with_reality(bot, guild, is_periodic=False):
                 for trigger_role_name in trigger_role_names & member_role_names:
                     trigger_role_obj = discord.utils.get(guild.roles, name=trigger_role_name)
                     if trigger_role_obj:
-                        await check_and_apply_tenure_role(bot, member, trigger_role_obj)
+                        try:
+                            await check_and_apply_tenure_role(bot, member, trigger_role_obj)
+                        except Exception as e:
+                            logger.error(f"Error processing trigger role for {member}: {e}")
 
         return changes
     except Exception as e:

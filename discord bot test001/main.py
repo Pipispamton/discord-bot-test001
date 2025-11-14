@@ -31,9 +31,9 @@ class RoleBot(discord.Client):
 
     async def setup_hook(self):
         # コマンドツリーをクリア（重複防止）
-        self.tree.clear_commands(guild=None)
-        for guild in self.guilds:
-            self.tree.clear_commands(guild=guild)
+    #    self.tree.clear_commands(guild=None)
+    #    for guild in self.guilds:
+    #        self.tree.clear_commands(guild=guild)
         
         await self._sync_commands()
 
@@ -127,10 +127,10 @@ async def on_ready():
     
     # 起動時にコマンドツリーをクリアして再同期
     try:
-        bot.tree.clear_commands(guild=None)
-        for guild in bot.guilds:
-            bot.tree.clear_commands(guild=guild)
-        logger.info("Command tree cleared")
+    #    bot.tree.clear_commands(guild=None)
+    #    for guild in bot.guilds:
+    #        bot.tree.clear_commands(guild=guild)
+    #    logger.info("Command tree cleared")
         
         await asyncio.sleep(1)  # API レート制限対応
         await bot._sync_commands()
