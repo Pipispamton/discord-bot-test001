@@ -1318,3 +1318,61 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
         exit(1)
+
+async def register_external_role_add(member: discord.Member, role: discord.Role):
+	"""外部でロールが付与されたときに内部データを登録する（自動削除対象用）"""
+	try:
+		guild_id, user_id = str(member.guild.id), str(member.id)
+		now_ts = now_jst().timestamp()
+		# 自動削除対象ロールのみ履歴・timestampを保存
+		if role.name in ROLES_TO_AUTO_REMOVE:
+			# 個人設定リセット
+			bot.data.remove_user_setting(guild_id, user_id, role.name)
+			bot.data.role_data.setdefault(guild_id, {}).setdefault(user_id, {})
+			# 既に登録済みでなければ timestamp を登録し履歴追加
+			if role.name not in bot.data.role_data[guild_id][user_id]:
+				bot.data.role_data[guild_id][user_id][role.name] = now_ts
+				bot.data.add_role_history(guild_id, user_id, role.name, now_ts)
+				await bot.data.save_all()
+				logger.info(f"Registered external role add: {member.display_name} / {role.name}")
+	except Exception as e:
+		logger.error(f"register_external_role_add error for {member}: {e}")
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+	"""外部でロールが付与/削除された際の検知処理。
+	付与されたロールに対して即時処理（テニュアルール判定 / 自動削除ロール登録）を行う。"""
+	try:
+		# roles は Role オブジェクトのリストなので集合差で追加ロールを検出
+		before_roles = {r.id: r for r in before.roles}
+		added = [r for r in after.roles if r.id not in before_roles]
+		if not added:
+			return
+
+		guild = after.guild
+		guild_id = str(guild.id)
+		tenure_rules = bot.data.tenure_rules.get(guild_id, {})
+
+		for role in added:
+			# 1) もし追加ロールが自動削除対象なら内部登録（timestamp / 履歴）
+			if role.name in ROLES_TO_AUTO_REMOVE:
+				# 非同期で登録（重くなりすぎないようtaskで実行）
+				asyncio.create_task(register_external_role_add(after, role))
+
+			# 2) もし追加ロールがテニュアのトリガーなら即時処理
+			if role.name in tenure_rules:
+				# check_and_apply_tenure_role は削除も行うため非同期タスクで起動
+				# （同期処理だとイベントハンドラが長時間ブロックされる可能性がある）
+				asyncio.create_task(_handle_trigger_role_immediate(after, role))
+	except Exception as e:
+		logger.error(f"on_member_update error for {after}: {e}")
+
+async def _handle_trigger_role_immediate(member: discord.Member, trigger_role: discord.Role):
+	"""トリガーロール付与検知時の即時処理ラッパー。
+	check_and_apply_tenure_role を呼んでから、処理結果に応じてログ等を出す。"""
+	try:
+		# 直接呼び出し（内部で対象ロール付与とトリガー削除を行う）
+		await check_and_apply_tenure_role(member, trigger_role)
+		logger.info(f"Handled trigger role immediately: {member.display_name} / {trigger_role.name}")
+	except Exception as e:
+		logger.error(f"_handle_trigger_role_immediate error for {member}: {e}")
